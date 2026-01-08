@@ -21,8 +21,6 @@ import csv
 from utils import utils
 np.set_printoptions(suppress=True, precision=16)
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
-
 parser = argparse.ArgumentParser(description='PolicyNetworkTraining')
 parser.add_argument('--lr', type=float, default=1e-4, help='learning rate') 
 parser.add_argument('--data_dir', default='dataset/', help='data directory')
