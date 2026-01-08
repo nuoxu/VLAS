@@ -14,6 +14,7 @@ python3 tools/train-VLAS.py \
       --dataset DOTA (or xView) \
       --cv_dir path_to_you_model \
       --num_actions 36/49/64/81/100 \
+      --num_cluster 12/24/36 \
       (--multiclass)
 ```
 ```shell
