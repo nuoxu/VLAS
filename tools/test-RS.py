@@ -23,8 +23,6 @@ torch.multiprocessing.set_sharing_strategy('file_system')
 import csv
 from utils import utils
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
-
 parser = argparse.ArgumentParser(description='PolicyNetworkTraining')
 parser.add_argument('--lr', type=float, default=1e-4, help='learning rate')
 parser.add_argument('--data_dir', default='dataset/', help='data directory')
@@ -113,3 +111,4 @@ testloader = torchdata.DataLoader(testset, batch_size=args.batch_size, shuffle=F
 budgets = [int(args.num_actions/6.), int(args.num_actions/3.), int(args.num_actions/2.)]
 for budget in budgets:
     test(0, budget)
+
