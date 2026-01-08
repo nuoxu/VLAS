@@ -1,0 +1,18 @@
+1:plane
+2:ship
+3:storage tank
+4:baseball diamond
+5:tennis court
+6:swimming pool
+7:ground track field
+8:harbor
+9:bridge
+10:large vehicle
+11:small vehicle
+12:helicopter
+13:roundabout
+14:soccer ball field
+15:basketball court
+16:container crane
+17:airport
+18:helipad

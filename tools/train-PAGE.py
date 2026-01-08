@@ -1,0 +1,431 @@
+"""
+Train PAGE Model
+"""
+import sys
+sys.path.insert(0, '.')
+import os
+import random
+import torch
+import torch.utils.data as torchdata
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+import tqdm
+import torch.optim as optim
+import torch.backends.cudnn as cudnn
+cudnn.benchmark = True
+import argparse
+from torch.autograd import Variable
+#from tensorboard_logger import configure, log_value
+from torch.distributions import Bernoulli
+from torch.distributions.categorical import Categorical
+from copy import deepcopy as c
+import csv
+from utils import utils
+import open_clip
+import pdb
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
+
+parser = argparse.ArgumentParser(description='PolicyNetworkTraining')
+parser.add_argument('--lr', type=float, default=1e-4, help='learning rate') 
+parser.add_argument('--data_dir', default='dataset/', help='data directory')
+parser.add_argument('--dataset', choices=['DOTA', 'xView'], default='DOTA', help='name of dataset')
+parser.add_argument('--load', default=None, help='checkpoint to load agent from')
+parser.add_argument('--cv_dir', default='model/', help='checkpoint directory (models and logs are saved here)')
+parser.add_argument('--batch_size', type=int, default=32, help='batch size')
+parser.add_argument('--img_size', type=int, default=448, help='PN Image Size')
+parser.add_argument('--epoch_step', type=int, default=100, help='epochs after which lr is decayed')
+parser.add_argument('--max_epochs', type=int, default=120, help='total epochs to run')
+parser.add_argument('--num_workers', type=int, default=8, help='Number of Workers')
+parser.add_argument('--test_epoch', type=int, default=10, help='At every N epoch test the network')
+parser.add_argument('--parallel', action='store_true', default=True, help='use multiple GPUs for training')
+parser.add_argument('--alpha', type=float, default=0.8, help='probability bounding factor')
+parser.add_argument('--beta', type=float, default=0.1, help='Coarse detector increment')
+parser.add_argument('--sigma', type=float, default=0.5, help='cost for patch use')
+parser.add_argument('--num_actions', choices=[36, 49, 64, 81, 100], type=int, default=64, help='total number of action/grid')
+parser.add_argument('--num_cluster', choices=[12, 24, 36], type=int, default=24, help='total number of cluster centers')
+parser.add_argument('--multiclass', action='store_true', default=False, help='multi-class in language instruction')
+args = parser.parse_args()
+
+if not os.path.exists(args.cv_dir):
+    os.makedirs(args.cv_dir)
+if not os.path.exists(args.cv_dir+'/'+args.dataset+'/'+str(args.num_actions)):
+    os.makedirs(args.cv_dir+'/'+args.dataset+'/'+str(args.num_actions))
+
+def coord(x):
+    x_= x//6 + 1  #7
+    y_= x%6       #7
+    return (x_,y_)
+
+def get_graph(dataset, num_grids, num_cluster):
+    graph_dir = "graph/{}_cluster{}_grid{}.npy".format(dataset.lower(), num_cluster, num_grids)
+    graph = np.load(graph_dir, allow_pickle=True).item()
+    node_feat = torch.from_numpy(graph['node_features'])
+    node_lab = torch.from_numpy(graph['node_labels'])
+    edge = torch.from_numpy(graph['edges'])
+    return node_feat, node_lab, edge
+
+def get_target_node_index(classnames, label_to_idx, node_label):
+    target_node_index = []
+    for classname in classnames:
+        cln = classname.split(', ')
+        cls_nm = [label_to_idx[c] for c in cln]
+        target_node_index.append(torch.argmax(torch.sum(node_label[:, cls_nm], 1, True)))
+    return torch.LongTensor(target_node_index)
+
+## PAGE training function
+def train(epoch):
+    # select a random search budget within a range at the start of every training epochs
+    search_budget = random.randint(int(args.num_actions/6.), int(args.num_actions/2.)) 
+    batch_query = 3
+    # set the agent in training mode
+    agent.train()
+    # initialize lists that holds the record of search performance
+    rewards, total_reward, policies = [], [], []
+    label_to_idx = {}
+    dataset_name = args.dataset
+    with open('dataset/{}_class_labels.txt'.format(dataset_name.lower())) as f:
+        for idx, row in enumerate(csv.reader(f)):
+            label_to_idx[row[0].split(":")[1]] = idx
+    ## Iterate over training data
+    for batch_idx, (inputs, targets, classnames, chips) in tqdm.tqdm(enumerate(trainloader), total=len(trainloader)):
+        inputs = Variable(inputs)
+        if not args.parallel:
+            inputs = inputs.cuda()
+
+        # stores the information of previous search queries
+        search_info = torch.zeros((int(inputs.shape[0]), args.num_actions)).cuda() 
+        #Stores the information of other queried location in a batch
+        loc_query_batch = torch.zeros((int(inputs.shape[0]), args.num_actions)).cuda()
+        # stores the information of previously selected grids as target 
+        mask_info = torch.ones((int(inputs.shape[0]), args.num_actions)).cuda()
+        #store the information about the remaining query
+        query_info = torch.zeros(int(inputs.shape[0])).cuda()
+        # stores the name of class after tokenization
+        classname_feat = tokenizer(classnames).cuda()
+        # stores current chip
+        chips = chips.cuda()
+        current_chips_index = torch.randint(args.num_actions, (int(inputs.shape[0]), )).cuda()
+        chips_index = current_chips_index[..., None, None, None, None].expand((-1, -1)+chips.shape[2:]).cuda()
+        chips_chosen = torch.gather(chips, 1, chips_index).squeeze(1)
+
+        # Get graph
+        node_feat, node_lab, edge = get_graph(args.dataset, args.num_actions, args.num_cluster)
+        target_node_index = get_target_node_index(classnames, label_to_idx, node_lab)
+        node_feat = node_feat.expand((int(inputs.shape[0]),) + node_feat.shape)
+        edge = edge.expand((int(inputs.shape[0]),) + edge.shape)
+        
+        # Start an episode
+        policy_loss = []; search_history = []; ce_loss = []
+        p_loss = torch.zeros(int(inputs.shape[0])).cuda()
+        store_policy_out = []
+        adv_store = [] ; log_prob_store = []
+        # Find the loss for only the policy network
+        loss_static = nn.BCEWithLogitsLoss() #nn.BCELoss()#CrossEntropyLoss()
+        
+        # Iterate untill search budget diminishes
+        for step_ in range(search_budget):
+            
+            if (step_%batch_query == 0):
+                updated_search_info = search_info
+                
+            query_remain = search_budget - step_
+            #store the information about the remaining query
+            query_left = torch.add(query_info, query_remain).cuda()
+            # agents performs based on the following information: input, previous search history and the number of query left, other queried loc
+            logit, grid_prob, node_feat = agent.forward(inputs, classname_feat, chips_chosen, node_feat, edge, target_node_index, updated_search_info, loc_query_batch) 
+            grid_prob_net = grid_prob.view(grid_prob.size(0), -1)
+            alpha_hp = np.clip(args.alpha + epoch * 0.001, 0.6, 0.95)
+            grid_prob_out = grid_prob_net*alpha_hp + (1-alpha_hp) * (1-grid_prob_net)
+            
+            loss_cls = loss_static(grid_prob_net.float(), targets.float().cuda()) 
+            ce_loss.append(loss_cls)           
+            # Apply a softmax in order to obtain a probability distribution over grids
+            probs = F.softmax(logit, dim = 1)
+            # we mask the probability distribution and assign 0 probability to the grids that is already selected by the agent 
+            mask_probs = probs * mask_info.clone() 
+            # Sample the policies from the Categorical distribution characterized by agent
+            distr = Categorical(mask_probs)
+            policy_sample = distr.sample()
+            store_policy_out.append(policy_sample)
+
+            # Select current chip
+            current_chips_index = policy_sample
+            chips_index = current_chips_index[..., None, None, None, None].expand((-1, -1)+chips.shape[2:])
+            chips_chosen = torch.gather(chips, 1, chips_index).squeeze(1)
+
+            # Random policy - used as baseline policy in the training step
+            policy_map = torch.randint(0, args.num_actions, (int(inputs.shape[0]),)) 
+            
+            # Find the reward for the baseline policy
+            reward_map = utils.compute_reward(targets, policy_map.data, args.beta, args.sigma)
+            # Find the reward for the sampled policy
+            reward_sample = utils.compute_reward(targets, policy_sample.data, args.beta, args.sigma)
+            rewards.append(reward_sample)
+            for sample_id in range(int(inputs.shape[0])):
+                # Update the search history based on the current reward 
+                loc_query_batch[sample_id, int(policy_sample[sample_id].data)] = 1
+                if (int(reward_sample[sample_id]) == 1):
+                     search_info[sample_id, int(policy_sample[sample_id].data)] = int(reward_sample[sample_id])
+                else:
+                     search_info[sample_id, int(policy_sample[sample_id].data)] = -1
+                # Update the mask info based on the current action taken by the agent
+                mask_info[sample_id, int(policy_sample[sample_id].data)] = 0
+            # Compute the advantage value
+            advantage = reward_sample.cuda().float() - reward_map.cuda().float()
+            adv_store.append(advantage)
+            # Find the loss for only the policy network
+            loss = -distr.log_prob(policy_sample)           
+            log_prob_store.append(loss)
+            # Final loss according to REINFORCE objective to train the policy/agent
+            loss = loss * Variable(advantage).expand_as(policy_sample)
+            policy_loss.append(loss)
+            
+        b = [] ; c = [] ; policy_loss = []; temp = []
+        temp = torch.zeros(int(inputs.shape[0])).cuda()
+        for t in range(search_budget)[::-1]:   
+            adv_store[t] = adv_store[t] + (0.01) * temp  #0.01
+            temp = adv_store[t]     
+        for log_prob, disc_return in zip(log_prob_store, adv_store): # returns
+            policy_loss.append(log_prob * Variable(disc_return).expand_as(log_prob))   #added Variable        
+        # Cut the episode length by cost budget,by assigning the loss = grad_log_pi*furure_discounted_reward = 0
+        for sample in range(int(inputs.shape[0])):
+            flag = False
+            remain_cost = 200
+            last_visited_grid = {0: [], 1: [], 2: []} # the number of id = batch query number
+            for time_step in range(len(store_policy_out)):
+                agent_id = int(time_step % batch_query)
+                if flag == False:
+                    grid_id = int(store_policy_out[time_step][sample]) 
+                    p1, p2 = coord(grid_id)
+                    if len(last_visited_grid[agent_id]) == 0:
+                        p1_last, p2_last = coord(grid_id)           
+                        distance = abs(p1-p1_last) + abs(p2 - p2_last)
+                        last_visited_grid[agent_id].append((p1, p2))
+                    else:
+                        p1_last = last_visited_grid[agent_id][-1][0]
+                        p2_last = last_visited_grid[agent_id][-1][1]
+                        distance = abs(p1-p1_last) + abs(p2 - p2_last)
+                        last_visited_grid[agent_id].append((p1, p2))
+                    remain_cost = remain_cost - distance
+                    p1_last, p2_last = p1, p2
+                    if remain_cost < 0:
+                        policy_loss[time_step][sample] = 0
+                        flag = True
+                else:
+                    policy_loss[time_step][sample] = 0
+        loss_rl = torch.cat(policy_loss).mean() 
+        loss_ce = torch.mean(torch.stack(ce_loss))
+        loss = loss_rl + (0.1) * loss_ce  
+        # update the policy network parameters 
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        
+        # store the search result in the following lists
+        batch_reward = torch.cat(rewards).mean() 
+        total_reward.append(batch_reward.cpu())
+        policies.append(policy_sample.data.cpu())
+    
+    reward = utils.performance_stats_search(policies, total_reward)
+    with open(args.cv_dir+'/'+args.dataset+'/'+str(args.num_actions)+'/'+'PAGE_log.txt','a') as f:
+        f.write('Train: %d | Rw: %.2f \n' % (epoch, reward))
+
+    # agent_state_dict = agent.module.state_dict() if args.parallel else agent.state_dict()
+    # state = {
+    #   'agent': agent_state_dict,
+    #   'epoch': epoch,
+    #   'reward': reward,
+    # }
+    # torch.save(state, args.cv_dir+'/'+args.dataset+'/'+str(args.num_actions)+"/PAGE.pt")
+    
+    print('Train: %d | Rw: %.2F | CE: %.2F | RL: %.2F' % (epoch, reward, loss_ce, loss_rl))
+
+# test the agent's performance on PAGE setting    
+def test(epoch, best_sr): 
+    search_budget = int(args.num_actions/3.)
+    batch_query = 3
+    # set the agent in evaluation mode
+    agent.eval()
+    # initialize lists to store search outcomes
+    targets_found, num_targets = list(), list()
+    acc_steps = []; tpr_steps =[]; ant_steps = {}
+    label_to_idx = {}
+    dataset_name = args.dataset
+    with open('dataset/{}_class_labels.txt'.format(dataset_name.lower())) as f:
+        for idx, row in enumerate(csv.reader(f)):
+            ant_steps[row[0].split(":")[1]] = []
+            label_to_idx[row[0].split(":")[1]] = idx
+    # iterate over the test data
+    for batch_idx, (inputs, targets, classnames, numbers, chips) in tqdm.tqdm(enumerate(testloader), total=len(testloader)):
+
+        inputs = Variable(inputs, volatile=True)
+        if not args.parallel:
+            inputs = inputs.cuda()
+        
+        # stores the information of previous search queries
+        search_info = torch.zeros((int(inputs.shape[0]), args.num_actions)).cuda()
+        #Stores the information of other queried location in a batch
+        loc_query_batch = torch.zeros((int(inputs.shape[0]), args.num_actions)).cuda()
+        # stores the information of previously selected grids as target 
+        mask_info = torch.ones((int(inputs.shape[0]), args.num_actions)).cuda()
+        #store the information about the remaining query
+        query_info = torch.zeros(int(inputs.shape[0])).cuda()
+        # stores the name of class after tokenization
+        classname_feat = tokenizer(classnames).cuda()
+        # stores current chip
+        chips = chips.cuda()
+        current_chips_index = torch.randint(args.num_actions, (int(inputs.shape[0]), )).cuda()
+        chips_index = current_chips_index[..., None, None, None, None].expand((-1, -1)+chips.shape[2:]).cuda()
+        chips_chosen = torch.gather(chips, 1, chips_index).squeeze(1)
+
+        # Get graph
+        node_feat, node_lab, edge = get_graph(args.dataset, args.num_actions, args.num_cluster)
+        target_node_index = get_target_node_index(classnames, label_to_idx, node_lab)
+        node_feat = node_feat.expand((int(inputs.shape[0]),) + node_feat.shape)
+        edge = edge.expand((int(inputs.shape[0]),) + edge.shape)
+
+        # Start an episode
+        policy_loss = []; search_history = []; reward_history = [];
+        
+        for step_ in range(search_budget): 
+            if (step_%batch_query == 0):
+                updated_search_info = search_info 
+                
+            query_remain = search_budget - step_
+            # number of query left
+            query_left = torch.add(query_info, query_remain).cuda()
+            # action taken by agent
+            logit, grid_prob, node_feat = agent.forward(inputs, classname_feat, chips_chosen, node_feat, edge, target_node_index, updated_search_info, loc_query_batch) 
+            grid_prob = F.sigmoid(grid_prob)
+            grid_prob_net = grid_prob.view(grid_prob.size(0), -1)
+            
+            # get the prediction of target from the agents intermediate output
+            policy_pred = grid_prob_net.data.clone()
+            policy_pred[policy_pred<0.5] = 0.0
+            policy_pred[policy_pred>=0.5] = 1.0
+            policy_pred = Variable(policy_pred)
+            
+            ### prediction result statistics
+            acc, tpr = utils.acc_calc(targets, policy_pred.data)
+            acc_steps.append(acc)
+            tpr_steps.append(tpr)
+            
+            # get the probability distribution over grids
+            probs = F.softmax(logit, dim=1)
+            # assign 0 probability to those grids that is already queried by agent
+            mask_probs = probs * mask_info.clone()  
+            # Sample the grid that corresponds to highest probability of being target
+            policy_sample = torch.argmax(mask_probs, dim=1)
+
+            # Select current chip
+            current_chips_index = policy_sample
+            chips_index = current_chips_index[..., None, None, None, None].expand((-1, -1)+chips.shape[2:])
+            chips_chosen = torch.gather(chips, 1, chips_index).squeeze(1)
+            # calcurate ANT
+            if classnames[0] not in ant_steps.keys():
+                ant_steps[classnames[0]] = []
+            ant_steps[classnames[0]].append(numbers[0][policy_sample[0]])
+
+            # compute the reward for the agent's action
+            reward_update = utils.compute_reward(targets, policy_sample.data, args.beta, args.sigma)
+            # get the outcome of an action in order to compute ESR/SR 
+            reward_sample = utils.compute_reward_batch(targets, policy_sample.data, args.beta, args.sigma)
+            
+            # Update search info and mask info after every query
+            for sample_id in range(int(inputs.shape[0])):
+                # Update the search history based on the current reward 
+                loc_query_batch[sample_id, int(policy_sample[sample_id].data)] = 1
+                if (int(reward_sample[sample_id]) == 1):
+                     search_info[sample_id, int(policy_sample[sample_id].data)] = int(reward_sample[sample_id])
+                else:
+                     search_info[sample_id, int(policy_sample[sample_id].data)] = -1
+                # Update the mask info based on the current action taken by the agent
+                mask_info[sample_id, int(policy_sample[sample_id].data)] = 0   
+            # store the episodic reward in the list
+            reward_history.append(reward_sample)   
+        # obtain the number of target grid in each sample (maximum value is search budget)
+        for target_id in range(int(targets.shape[0])):
+            temp = int(targets[target_id,:].sum())
+            if temp > search_budget:
+                num_targets.append(search_budget)
+            else:
+                num_targets.append(temp)
+
+        # concat the episodic reward over the samples in a batch
+        batch_reward = torch.cat(reward_history).sum() 
+        targets_found.append(batch_reward)    
+    ## compute ESR/ANT
+    temp_recall = torch.sum(torch.stack(targets_found))
+    recall = temp_recall / sum(num_targets)  
+    final_acc = torch.mean(torch.stack(acc_steps))
+    final_tpr = torch.mean(torch.stack(tpr_steps))
+    final_ant = []
+    final_mant = []
+    for k in ant_steps.keys():
+        final_ant.append(torch.mean(torch.stack(ant_steps[k])))
+        final_mant += ant_steps[k]
+    final_mant = torch.mean(torch.stack(final_mant))
+
+    # store the log in different log file
+    with open(args.cv_dir+'/'+args.dataset+'/'+str(args.num_actions)+'/'+'PAGE_log.txt','a') as f:
+        f.write('Test - Recall: %.2f | ACC: %.2f | TPR: %.2f | mANT: %.2f | SB: %.2f \n' % (recall, final_acc, final_tpr, final_mant, search_budget))\
+        # for idx, k in enumerate(ant_steps.keys()):
+        #     f.write('       ANT - %.2f : %s \n' % (final_ant[idx], k))
+
+    if (recall> best_sr):
+        print ("best_SR is:", recall)
+        best_sr = recall
+        # save the model --- agent
+        agent_state_dict = agent.module.state_dict() if args.parallel else agent.state_dict()
+        state = {
+          'agent': agent_state_dict,
+          'epoch': epoch,
+          'reward': recall,
+        }
+        # uncomment the following line and provide a path where you want to save the trained model
+        torch.save(state, args.cv_dir+'/'+args.dataset+'/'+str(args.num_actions)+"/PAGE.pt")
+    
+    print('Test - Recall: %.2F | ACC: %.2f | TPR: %.2f | mANT: %.2f | SB: %.2F' % (recall, final_acc, final_tpr, final_mant, search_budget))
+    return best_sr
+    
+#--------------------------------------------------------------------------------------------------------#
+# Get the data from dataloader
+trainset, testset = utils.get_datasetPAGE(args.img_size, args.data_dir+'/'+args.dataset+'/', args.num_actions, args.multiclass)
+trainloader = torchdata.DataLoader(trainset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
+testloader = torchdata.DataLoader(testset, batch_size=1, shuffle=False, num_workers=args.num_workers)
+
+# initialize the agent
+agent = utils.Model_search_Arch_VLM_PAGE(num_grids=args.num_actions)
+# ---- Load the pre-trained model ----------------------
+""" uncomment this if we want to start training from a pretrained model
+checkpoint = torch.load("path_stored_pretrained_model")
+agent.load_state_dict(checkpoint['agent'])
+start_epoch = checkpoint['epoch'] + 1
+print('loaded agent from %s' % args.load)
+"""
+
+start_epoch = 0
+if args.load is not None:
+    checkpoint = torch.load(args.load)
+    agent.load_state_dict(checkpoint['agent'])
+    start_epoch = checkpoint['epoch'] + 1
+    print('loaded agent from %s' % args.load)
+
+# Parallelize the models if multiple GPUs available - Important for Large Batch Size to Reduce Variance
+if args.parallel:
+    agent = nn.DataParallel(agent)
+agent.cuda()
+
+tokenizer = open_clip.get_tokenizer("RN50")
+
+# Update the parameters of the policy network
+optimizer = optim.Adam(agent.parameters(), lr=args.lr)
+best_sr = 0.0
+
+# Start training and testing
+for epoch in range(start_epoch, start_epoch+args.max_epochs+1):
+    train(epoch)
+    if epoch % args.test_epoch == 0:        
+        best_sr = test(epoch, best_sr)
