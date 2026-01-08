@@ -1,2 +1,47 @@
-# VLAS
-Visual-Language Active Search for Wide-Area Remote Sensing Imagery
+# Visual-Language Active Search for Wide-Area Remote Sensing Imagery
+
+## Setup
+- You should install prerequisites using: `pip install -r requirements.txt`
+- Our settings of dataset follows previous works, please refer to [VAS](https://github.com/anindyasarkarIITH/VAS).
+
+## Training and Evaluation
+### Training 
+```shell
+python3 tools/train-VLAS.py \
+      --dataset DOTA (or xView) \
+      --cv_dir path_to_you_model \
+      --num_actions 36/49/64/81/100 \
+      (--multiclass)
+```
+```shell
+python3 tools/train-PAGE.py \
+      --dataset DOTA \
+      --cv_dir path_to_you_model \
+      --num_actions 100
+```
+### Evaluation
+```shell
+python3 tools/test-VLAS.py \
+      --dataset DOTA \
+      --cv_dir path_to_you_model \
+      --num_actions 100
+```
+```shell
+python3 tools/test-PAGE.py \
+      --dataset DOTA \
+      --cv_dir path_to_you_model \
+      --num_actions 100
+```
+### Visualization
+```shell
+python3 tools/vis-VLAS.py \
+      --dataset DOTA \
+      --cv_dir path_to_you_model \
+      --num_actions 100
+```
+```shell
+python3 tools/vis-PAGE.py \
+      --dataset DOTA \
+      --cv_dir path_to_you_model \
+      --num_actions 100
+```
