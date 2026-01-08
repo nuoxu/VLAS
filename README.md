@@ -2,7 +2,7 @@
 
 ## Setup
 - You should install prerequisites using: `pip install -r requirements.txt`
-- Our settings of dataset follows previous works, please refer to [VAS](https://github.com/anindyasarkarIITH/VAS).
+- Our settings follow previous works, please refer to [VAS](https://github.com/anindyasarkarIITH/VAS).
 
 ## Dataset
 Please downoad [DOTA](https://captain-whu.github.io/DOTA/dataset.html) and [xView](https://challenge.xviewdataset.org/login) and place them in `dataset/`.
