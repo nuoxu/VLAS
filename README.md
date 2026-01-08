@@ -38,12 +38,6 @@ python3 tools/test-PAGE.py \
 ```
 ### Visualization
 ```shell
-python3 tools/vis-VLAS.py \
-      --dataset DOTA \
-      --cv_dir path_to_you_model \
-      --num_actions 100
-```
-```shell
 python3 tools/vis-PAGE.py \
       --dataset DOTA \
       --cv_dir path_to_you_model \
