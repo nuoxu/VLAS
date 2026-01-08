@@ -21,8 +21,6 @@ from torch.distributions import Bernoulli
 
 from utils import utils
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
-
 parser = argparse.ArgumentParser(description='PolicyNetworkTraining')
 parser.add_argument('--lr', type=float, default=1e-4, help='learning rate')
 parser.add_argument('--data_dir', default='dataset/', help='data directory')
