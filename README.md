@@ -6,6 +6,12 @@
 
 ## Dataset
 Please downoad [DOTA](https://captain-whu.github.io/DOTA/dataset.html) and [xView](https://challenge.xviewdataset.org/login) and place them in `dataset/`.
+```shell
+python3 tools/prepare_data_for_dota.py
+```
+```shell
+python3 tools/prepare_data_for_xview.py
+```
 
 ## Training and Evaluation
 ### Training 
