@@ -5,7 +5,7 @@
 - Our settings follow previous works, please refer to [VAS](https://github.com/anindyasarkarIITH/VAS).
 
 ## Dataset
-Please downoad [DOTA](https://captain-whu.github.io/DOTA/dataset.html) and [xView](https://challenge.xviewdataset.org/login) and place them in `dataset/`.
+Please downoad [DOTA](https://captain-whu.github.io/DOTA/dataset.html) and [xView](https://challenge.xviewdataset.org/login) and place them in `dataset/`. Prepare annotation files for the two datasets:
 ```shell
 python3 tools/prepare_data_for_dota.py
 ```
